@@ -1,0 +1,215 @@
+
+class MDNet(nn.Module):
+    def __init__(self, model_path=None, K=1):
+        super(MDNet, self).__init__()
+        self.K = K
+
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3,96,kernel_size=7,stride=2),
+            nn.ReLU(),
+            LRN(),
+            nn.MaxPool2d(kernel_size=3,stride=2)
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(96, 256, kernel_size=5, stride=2),
+            nn.ReLU(),
+            LRN(),
+            nn.MaxPool2d(kernel_size=3, stride=2)
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(256,512, kernel_size=3, stride=1),
+            nn.ReLU()
+        )
+
+
+
+
+        ''' 
+        # Spatial transformer localization-network
+        self.localization1 = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=7),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        )
+        self.localization2 = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        )
+
+        # Regressor for the 3 * 2 affine matrix
+        self.fc_loc1 = nn.Sequential(
+            nn.Linear(512 * 3 * 3, 512),
+            nn.ReLU(True)
+        )
+        self.fc_loc2 = nn.Sequential(
+            nn.Linear(512, 3 * 2)
+        )
+
+        # Initialize the weights/bias with identity transformation
+        self.fc_loc2[0].weight.data.fill_(0)
+        self.fc_loc2[0].bias.data = torch.FloatTensor([1, 0, 0, 0, 1, 0])
+        
+        '''
+        # Spatial transformer localization-network
+
+
+        self.localization1 = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(512 * 3 * 3, 4096),
+            nn.ReLU()
+        )
+
+
+        self.localization2 = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(4096 , 4096),
+            nn.ReLU()
+        )
+
+        # Regressor for the 3 * 2 affine matrix
+        self.loc_fc = nn.Sequential(
+            nn.Linear(4096, 3 * 2)
+        )
+
+
+        # Initialize the weights/bias with identity transformation
+        self.loc_fc[0].weight.data.fill_(0)
+        self.loc_fc[0].bias.data = torch.FloatTensor([1, 0, 0, 0, 1, 0])
+
+        self.fc4 = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(512*3*3,512),
+            nn.ReLU()
+        )
+        self.fc5 = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(512 , 512),
+            nn.ReLU()
+        )
+        self.branches = nn.ModuleList([nn.Sequential(nn.Dropout(0.5),
+                                                     nn.Linear(512, 2)) for _ in range(K)])
+
+        if model_path is not None:
+            if os.path.splitext(model_path)[1] == '.pth':
+                self.load_model(model_path)
+            elif os.path.splitext(model_path)[1] == '.mat':
+                self.load_mat_model(model_path)
+            else:
+                raise RuntimeError("Unkown model format: %s" % (model_path))
+        self.build_param_dict()
+
+    def build_param_dict(self):
+        self.params = OrderedDict()
+        for name, module in self.named_children():
+            append_params(self.params, module, name)
+        for k, module in enumerate(self.branches):
+            append_params(self.params, module, 'fc6_%d' % (k))
+
+    def set_learnable_params(self, layers):
+        for k, p in self.params.iteritems():
+            if any([k.startswith(l) for l in layers]):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+
+
+
+    def set_stn_learnable_params(self, layers):
+        for k, p in self.params.iteritems():
+            if any([k.startswith(l) for l in layers]):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+
+
+
+
+    def get_learnable_params(self):
+        params = OrderedDict()
+        for k, p in self.params.iteritems():
+            if p.requires_grad:
+                params[k] = p
+        return params
+
+    def forward(self, x, k=0, in_layer='conv1', out_layer='fc6'):
+        # forward model for mdnet and stn
+        x1 = self.conv1(x)
+        x2 = self.conv2(x1)
+        x3 = self.conv3(x2)
+        x4 = x3.view(x3.size(0), -1)   #fc shuru wei 1 wei
+        out1 = self.localization1(x4)
+        out2 = self.localization2(out1)
+        #out2 = out2.view(-1, 10 * 3 * 3)
+        theta2 = self.loc_fc(out2)
+        theta3 = theta2.view(-1, 2, 3)
+        #print "theta3 = " ,theta3
+        grid = F.affine_grid(theta3, x3.size())
+        out3 = F.grid_sample(x3, grid)
+        out4 = out3.view(out3.size(0), -1)
+        out5 = self.fc4(out4)
+        out6 = self.fc5(out5)
+        out7 = self.branches[k](out6)
+        if out_layer == 'fc6':
+            return out7
+        elif out_layer == 'fc6_softmax':
+            return F.softmax(out7)  # import torch.nn.functional as  F
+
+    def load_model(self, model_path):
+        states = torch.load(model_path)
+        shared_layers = states['shared_layers']
+        #self.load_state_dict(shared_layers)
+
+        #print "shared_layers = ", shared_layers[OrderedDict[0]]
+        self.conv1[0].weight.data = shared_layers['conv1.0.weight']
+        self.conv1[0].bias.data = shared_layers['conv1.0.bias']
+
+        self.conv2[0].weight.data = shared_layers['conv2.0.weight']
+        self.conv2[0].bias.data = shared_layers['conv2.0.bias']
+
+        self.conv3[0].weight.data = shared_layers['conv3.0.weight']
+        self.conv3[0].bias.data = shared_layers['conv3.0.bias']
+
+        self.fc4[1].weight.data = shared_layers['fc4.1.weight']
+        self.fc4[1].bias.data = shared_layers['fc4.1.bias']
+
+        self.fc5[1].weight.data = shared_layers['fc5.1.weight']
+        self.fc5[1].bias.data = shared_layers['fc5.1.bias']
+
+        #for i in range(k):
+            #self.branches[k] = shared_layers[k+10]
+
+
+    def load_mat_model(self, matfile):
+        mat = scipy.io.loadmat(matfile)
+        mat_layers = list(mat['layers'])[0]
+
+        print "self.conv1[0] = " ,self.conv1[0]
+        '''
+        # copy conv weights
+        for i in range(3):
+            weight, bias = mat_layers[i * 4]['weights'].item()[0]
+            self.layers[i][0].weight.data = torch.from_numpy(np.transpose(weight, (3, 2, 0, 1)))
+            self.layers[i][0].bias.data = torch.from_numpy(bias[:, 0])
+        '''
+        weight , bias = mat_layers[0 * 4]['weights'].item()[0]
+        self.conv1[0].weight.data = torch.from_numpy(np.transpose(weight, (3, 2, 0, 1)))
+        self.conv1[0].bias.data = torch.from_numpy(bias[:, 0])
+
+        weight, bias = mat_layers[1 * 4]['weights'].item()[0]
+        self.conv2[0].weight.data = torch.from_numpy(np.transpose(weight, (3, 2, 0, 1)))
+        self.conv2[0].bias.data = torch.from_numpy(bias[:, 0])
+
+        weight, bias = mat_layers[2 * 4]['weights'].item()[0]
+        self.conv3[0].weight.data = torch.from_numpy(np.transpose(weight, (3, 2, 0, 1)))
+        self.conv3[0].bias.data = torch.from_numpy(bias[:, 0])
+        '''
+        weight, bias = mat_layers[15]['weights'].item()[0]
+        self.localization1[1].weight.data = torch.from_numpy(np.transpose(weight, (3, 2, 0, 1)))
+        self.localization1[1].bias.data = torch.from_numpy(bias[:, 0])
+
+        weight, bias = mat_layers[17]['weights'].item()[0]
+        self.localization2[1].weight.data = torch.from_numpy(np.transpose(weight, (3, 2, 0, 1)))
+        self.localization2[1].bias.data = torch.from_numpy(bias[:, 0])
+        '''
+
